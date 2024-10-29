@@ -3,7 +3,7 @@
 use alloy_primitives::{hex, B256, U256};
 use proptest::{prelude::ProptestConfig, proptest};
 use proptest_arbitrary_interop::arb;
-use reth_db::{tables, Database};
+use reth_db::{cursor::DbDupCursorRW, tables, Database};
 use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
 use reth_primitives::StorageEntry;
 use reth_provider::{test_utils::create_test_provider_factory, ProviderError};
@@ -210,6 +210,7 @@ fn failure() {
     let (_, updates) = hb.split();
 
     for (k, v) in updates {
+        println!("update after first insertion {k:?}: {v:?}");
         storage_trie_cursor
             .upsert(hashed_address, StorageTrieEntry { nibbles: k.into(), node: v })
             .unwrap();
@@ -218,7 +219,6 @@ fn failure() {
     let mut hashed_storage_cursor =
         tx.tx_ref().cursor_dup_write::<tables::HashedStorages>().unwrap();
 
-    use reth_db::cursor::DbDupCursorRW;
     for key in keys {
         hashed_storage_cursor
             .append_dup(
@@ -231,7 +231,7 @@ fn failure() {
     let mut changed = PrefixSetMut::default();
     changed.insert(Nibbles::from_nibbles([0x4, 0x2, 0x3, 0x0]));
     let mut trie_cursor = DatabaseStorageTrieCursor::new(storage_trie_cursor, hashed_address);
-    let walker = TrieWalker::new(&mut trie_cursor, changed.freeze());
+    let walker = TrieWalker::new(&mut trie_cursor, changed.freeze()).with_deletions_retained(true);
     let hashed_cursor = DatabaseHashedStorageCursor::new(hashed_storage_cursor, hashed_address);
     let mut node_iter = TrieNodeIter::new(walker, hashed_cursor);
 
@@ -254,17 +254,54 @@ fn failure() {
     let nodes = vec![
         (
             Nibbles::from_vec(vec![0x4]),
-            BranchNodeCompact::new(0b101, 0b101, 0b001, vec![B256::random()], None),
+            BranchNodeCompact::new(
+                0b101, // state_mask: paths 0 and 2 set
+                0b001, // tree_mask: no paths set (no direct children)
+                0b101, // hash_mask: paths 0 and 2 set
+                vec![
+                    B256::from(hex!(
+                        "578fbeffdc3bb6650a74ecdeedf46e5be0513887e0672dba303bf5e141050176"
+                    )),
+                    B256::from(hex!(
+                        "8a610582a58f7b31717b0b63544f1804e77e6422dc9f688bda7352e7fb9c6317"
+                    )),
+                ],
+                None,
+            ),
         ),
         (
             Nibbles::from_vec(vec![0x4, 0x2]),
-            BranchNodeCompact::new(0b1001, 0b0001, 0b0, vec![], None),
+            BranchNodeCompact::new(
+                0b1001, // state_mask: paths 0 and 3 set
+                0b0000, // tree_mask: no paths set
+                0b0000, // hash_mask: no hashes needed for leaf paths
+                vec![],
+                None,
+            ),
         ),
         (
             Nibbles::from_vec(vec![0x5]),
-            BranchNodeCompact::new(0b1, 0b1, 0b1, vec![B256::random()], None),
+            BranchNodeCompact::new(
+                0b11, // state_mask: paths 0 and 1 set
+                0b00, // tree_mask: no paths set
+                0b11, // hash_mask: paths 0 and 1 set
+                vec![
+                    B256::from(hex!(
+                        "d28dc99be590c99d9f90be544694830e34c858f1511d5002f5103fee37c7c2c2"
+                    )),
+                    B256::from(hex!(
+                        "a7a5cc8e74436c426c32b768390f44c6b2b1ae54962eb3d76dd8d7428f3a9e62"
+                    )),
+                ],
+                None,
+            ),
         ),
     ];
+
+    for (key, value) in updates.clone() {
+        println!("update {key:?}: {value:?}");
+    }
+
     for (path, node) in &nodes {
         assert_eq!(Some(node), updates.get(path), "node mismatch at {path:?}");
         println!("node at path {path:?}: {node:?}");
