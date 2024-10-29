@@ -1,21 +1,24 @@
 #![allow(missing_docs)]
 
-use alloy_primitives::B256;
+use alloy_primitives::{hex, B256, U256};
 use proptest::{prelude::ProptestConfig, proptest};
 use proptest_arbitrary_interop::arb;
 use reth_db::{tables, Database};
 use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
+use reth_primitives::StorageEntry;
 use reth_provider::{test_utils::create_test_provider_factory, ProviderError};
 use reth_trie::{
+    node_iter::{TrieElement, TrieNodeIter},
     prefix_set::{PrefixSetMut, TriePrefixSets},
     trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory},
     updates::TrieUpdates,
     walker::TrieWalker,
-    StorageTrieEntry,
+    HashBuilder, StorageTrieEntry,
 };
 use reth_trie_common::{BranchNodeCompact, Nibbles};
 use reth_trie_db::{
-    DatabaseAccountTrieCursor, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory,
+    DatabaseAccountTrieCursor, DatabaseHashedStorageCursor, DatabaseStorageTrieCursor,
+    DatabaseTrieCursorFactory,
 };
 use std::sync::Arc;
 
@@ -180,4 +183,90 @@ fn test_trie_walker_with_real_db_populated_account() {
             //assert!(result.is_some());
         }
     );
+}
+
+#[test]
+fn failure() {
+    let factory = create_test_provider_factory();
+    let tx = factory.provider_rw().unwrap();
+    let mut storage_trie_cursor = tx.tx_ref().cursor_dup_write::<tables::StoragesTrie>().unwrap();
+
+    let hashed_address = B256::random();
+
+    let keys = [
+        &hex!("4000000000000000000000000000000000000000000000000000000000000000"),
+        &hex!("4010000000000000000000000000000000000000000000000000000000000000"),
+        &hex!("4200000000000000000000000000000000000000000000000000000000000000"),
+        &hex!("4230000000000000000000000000000000000000000000000000000000000000"),
+        &hex!("5000000000000000000000000000000000000000000000000000000000000000"),
+        &hex!("5010000000000000000000000000000000000000000000000000000000000000"),
+    ];
+
+    let mut hb = HashBuilder::default().with_updates(true);
+    for key in keys {
+        hb.add_leaf(Nibbles::unpack(&key), &alloy_rlp::encode_fixed_size(&U256::MAX));
+    }
+    hb.root();
+    let (_, updates) = hb.split();
+
+    for (k, v) in updates {
+        storage_trie_cursor
+            .upsert(hashed_address, StorageTrieEntry { nibbles: k.into(), node: v })
+            .unwrap();
+    }
+
+    let mut hashed_storage_cursor =
+        tx.tx_ref().cursor_dup_write::<tables::HashedStorages>().unwrap();
+
+    use reth_db::cursor::DbDupCursorRW;
+    for key in keys {
+        hashed_storage_cursor
+            .append_dup(
+                hashed_address,
+                StorageEntry { key: B256::from_slice(key), value: U256::MAX },
+            )
+            .unwrap();
+    }
+
+    let mut changed = PrefixSetMut::default();
+    changed.insert(Nibbles::from_nibbles([0x4, 0x2, 0x3, 0x0]));
+    let mut trie_cursor = DatabaseStorageTrieCursor::new(storage_trie_cursor, hashed_address);
+    let walker = TrieWalker::new(&mut trie_cursor, changed.freeze());
+    let hashed_cursor = DatabaseHashedStorageCursor::new(hashed_storage_cursor, hashed_address);
+    let mut node_iter = TrieNodeIter::new(walker, hashed_cursor);
+
+    let mut hb = HashBuilder::default().with_updates(true);
+    println!("\nComputing");
+    while let Some(next) = node_iter.try_next().unwrap() {
+        println!("next {next:?}");
+        match next {
+            TrieElement::Branch(branch) => {
+                hb.add_branch(branch.key, branch.value, branch.children_are_in_trie);
+            }
+            TrieElement::Leaf(key, value) => {
+                hb.add_leaf(Nibbles::unpack(key), &alloy_rlp::encode_fixed_size(&value));
+            }
+        }
+    }
+    hb.root();
+    let (_, updates) = hb.split();
+
+    let nodes = vec![
+        (
+            Nibbles::from_vec(vec![0x4]),
+            BranchNodeCompact::new(0b101, 0b101, 0b001, vec![B256::random()], None),
+        ),
+        (
+            Nibbles::from_vec(vec![0x4, 0x2]),
+            BranchNodeCompact::new(0b1001, 0b0001, 0b0, vec![], None),
+        ),
+        (
+            Nibbles::from_vec(vec![0x5]),
+            BranchNodeCompact::new(0b1, 0b1, 0b1, vec![B256::random()], None),
+        ),
+    ];
+    for (path, node) in &nodes {
+        assert_eq!(Some(node), updates.get(path), "node mismatch at {path:?}");
+        println!("node at path {path:?}: {node:?}");
+    }
 }
